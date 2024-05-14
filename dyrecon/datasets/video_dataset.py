@@ -28,6 +28,12 @@ class VideoDatasetBase:
         all_data = torch.from_numpy(vid).float().view(vid.shape[0], -1, 3) # T x H*W x 3
         self.n_frames = all_mgrid.shape[0]
 
+        if True:
+            _all_data = all_data.view(*sidelength, 3).cpu().numpy()
+            _path = '../model_outputs/' + config.scene + '.npy'
+            np.save(_path, _all_data)
+            print('Saved video to', _path)
+
         np.random.seed(42)
         if unseen_strategy == 'random':
             n_val_samples_per_frame = int(test_fraction * all_mgrid.shape[1])

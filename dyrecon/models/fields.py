@@ -1,3 +1,4 @@
+import rff
 import torch
 import torch.nn as nn
 import numpy as np
@@ -96,6 +97,7 @@ class SDFNetwork(BaseModel):
 
         input_ch_1 = self.d_in_1
         input_ch_2 = self.d_in_2
+
         if self.multires > 0:
             embed_fn, input_ch_1 = get_embedder(self.multires, input_dims=self.d_in_1)
             self.embed_fn_fine = embed_fn
@@ -400,6 +402,16 @@ class TopoNetwork(HyperNetwork):
 @models.register('siren_mlp')
 class SirenMLP(BaseModel):
     def setup(self):
+        self.space_features = self.config.in_features - 1
+        self.time_mask = torch.tensor([0] +
+                     self.space_features * [1.0],
+                     ).unsqueeze(0).unsqueeze(0)
+        self.fixed_time_mask = torch.tensor([30.0 / self.config.omega] +
+                                      self.space_features * [1.0],
+                                      ).unsqueeze(0).unsqueeze(0)
+        self.disable_time = self.config.disable_time
+
+
         in_features = self.config.in_features
         out_features = self.config.out_features
         hidden_features = self.config.hidden_features
@@ -415,6 +427,7 @@ class SirenMLP(BaseModel):
 
         dims = [in_features] + [hidden_features for _ in range(num_hidden_layers)] + [out_features]
         self.nl = Sine()
+        self.first_nl = Sine(self.config.omega)
         self.net = []
         for i in range(len(dims) - 1):
             _rank = composition_rank if i in resfield_layers else 0
@@ -444,8 +457,18 @@ class SirenMLP(BaseModel):
 
     def forward(self, coords, frame_id=None, input_time=None):
         x = coords
-        for lin in self.net[:-1]:
-            x = self.nl(lin(x, frame_id=frame_id, input_time=input_time))
+
+        if self.disable_time:
+            x = x * self.time_mask.to(device=x.device)
+        else:
+            x = x * self.fixed_time_mask.to(device=x.device)
+
+        for i, lin in enumerate(self.net[:-1]):
+            x = lin(x, frame_id=frame_id, input_time=input_time)
+            if i == 0:
+                x = self.first_nl(x)
+            else:
+                x = self.nl(x)
             if lin.compression == 'resnet' and lin.capacity > 0:
                 if frame_id.numel() == 1:
                     x = x + lin.resnet_vec[frame_id].view(1, 1, lin.resnet_vec.shape[-1])
@@ -458,6 +481,12 @@ class SirenMLP(BaseModel):
 @models.register('relu_mlp')
 class ReluMLP(BaseModel):
     def setup(self):
+        self.space_features = self.config.in_features - 1
+        self.time_mask = torch.tensor([0] +
+                                      self.space_features * [1.0],
+                                      ).unsqueeze(0).unsqueeze(0)
+        self.disable_time = self.config.disable_time
+
         in_features = self.config.in_features
         out_features = self.config.out_features
         hidden_features = self.config.hidden_features
@@ -472,6 +501,24 @@ class ReluMLP(BaseModel):
         compression = self.config.compression
 
         dims = [in_features] + [hidden_features for _ in range(num_hidden_layers)] + [out_features]
+
+        if self.config.get('positional_encoding', False):
+            multires = 10
+            if multires > 0:
+                embed_fn, in_features = get_embedder(multires, input_dims=in_features)
+                self.embed_fn_1 = embed_fn
+                dims[0] = in_features
+        else:
+            encoded_size = self.config.rff_size
+            sigma = self.config.sigma
+            self.embedder_obj = rff.layers.GaussianEncoding(
+                sigma=sigma, input_size=3, encoded_size=encoded_size  # 2
+            )
+            in_features = encoded_size * 2
+            dims[0] = in_features
+            self.embed_fn_1 = lambda x, eo=self.embedder_obj: eo(x)
+
+
         self.nl = torch.nn.ReLU()
         self.net = []
         for i in range(len(dims) - 1):
@@ -479,7 +526,10 @@ class ReluMLP(BaseModel):
             _capacity = capacity if i in resfield_layers else 0
 
             lin = resfields.Linear(dims[i], dims[i + 1], rank=_rank, capacity=_capacity, mode=mode, compression=compression, fuse_mode=fuse_mode, coeff_ratio=coeff_ratio)
-            lin.apply(self.init_weights_normal)
+            if self.config.get('uniform_init', False):
+                lin.apply(self.init_weights_uniform)
+            else:
+                lin.apply(self.init_weights_normal)
             self.net.append(lin)
         self.net = torch.nn.ModuleList(self.net)
 
@@ -488,9 +538,23 @@ class ReluMLP(BaseModel):
     def init_weights_normal(m):
         if hasattr(m, 'weight'):
             nn.init.kaiming_normal_(m.weight, a=0.0, nonlinearity='relu', mode='fan_in')
-    
+
+    @staticmethod
+    @torch.no_grad()
+    def init_weights_uniform(m):
+        if hasattr(m, 'weight'):
+            nn.init.uniform_(m.weight, -0.05, 0.05)
+
     def forward(self, coords, frame_id=None, input_time=None):
         x = coords
+        if self.disable_time:
+            x = x * self.time_mask.to(device=x.device)
+
+        if self.config.get('positional_encoding', False):
+            x = self.embed_fn_1(x, alpha_ratio=1.0)
+        else:
+            x = self.embed_fn_1(x)
+
         for lin in self.net[:-1]:
             x = self.nl(lin(x, frame_id=frame_id, input_time=input_time))
             if lin.compression == 'resnet' and lin.capacity > 0:
@@ -503,9 +567,13 @@ class ReluMLP(BaseModel):
 
         
 class Sine(nn.Module):
+    def __init__(self, omega=30):
+        super().__init__()
+        self.omega = omega
+
     def forward(self, input):
         # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of factor 30
-        return torch.sin(30 * input)
+        return torch.sin(self.omega * input)
 
 @models.register('ngp_mlp')
 class NGPMLP(BaseModel):

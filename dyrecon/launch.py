@@ -1,10 +1,17 @@
 import os
 import os.path as osp
+from pathlib import Path
+
 import torch
 import time
 import logging
 import argparse
 import sys
+import numpy as np
+from matplotlib import pyplot as plt
+
+from datasets.video_dataset import VideoDataModule
+
 sys.path.append(osp.join(osp.dirname(osp.dirname(osp.abspath(__file__))), 'resfields'))
 
 parser = argparse.ArgumentParser()
@@ -69,6 +76,28 @@ def main():
         last_ckpt = args.model_ckpt
     resume_from_checkpoint = config.get('resume_from_checkpoint', last_ckpt)
     system = systems.make(config.system.name, config, resume_from_checkpoint)
+
+    if config.get('save_outputs', False) and isinstance(dm, VideoDataModule):
+        dm.setup('predict')
+        for i in range(10):
+            system = systems.make(config.system.name, config, resume_from_checkpoint)
+            system = system.to(device='cuda')
+            system.model.training = False
+            data = next(iter(dm.predict_dataloader()))
+
+            with torch.no_grad():
+                out = system(data['coords'].squeeze(0).to(device='cuda'),
+                             data['frame_ids'].squeeze(0).to(device='cuda')
+                             ).cpu()
+
+            out = out.reshape(*dm.predict_dataset.sidelength, 3).numpy()
+            idx = np.random.randint(0, out.shape[0])
+            out = out[idx]
+            frequency_param = config.model.get('omega', config.model.get('sigma', None))
+            path = f"../model_outputs/{config.dataset.scene}__{config.model.name}__time_{config.model.disable_time}/{frequency_param}/{i}.npy"
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, out)
+        exit(0)
 
     loggers = []
     if args.train:
